@@ -1,0 +1,97 @@
+parameters:
+  # Default values
+  unitTest: true
+  codeCoverage: false
+  componentGovernance: false
+  packageArtifacts: false
+  packageIntegrationTests: false
+  targetBuildFramework: ''
+
+steps:
+- task: UseDotNet@2
+  displayName: 'Use .NET SDK'
+  inputs:
+    useGlobalJson: true
+
+- ${{ if eq(parameters.targetBuildFramework, '') }}:
+  - task: DotNetCoreCLI@2
+    displayName: 'dotnet build $(buildConfiguration)'
+    inputs:
+      command: build
+      arguments: '--configuration $(buildConfiguration) -p:ContinuousIntegrationBuild=true -p:AssemblyVersion="$(assemblySemVer)" -p:FileVersion="$(assemblySemFileVer)" -p:InformationalVersion="$(informationalVersion)" -p:Version="$(majorMinorPatch)" -warnaserror'
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+- ${{ if ne(parameters.targetBuildFramework, '') }}:
+  - task: DotNetCoreCLI@2
+    displayName: 'dotnet build $(buildConfiguration)'
+    inputs:
+      command: build
+      arguments: '--configuration $(buildConfiguration) -p:ContinuousIntegrationBuild=true -p:AssemblyVersion="$(assemblySemVer)" -p:FileVersion="$(assemblySemFileVer)" -p:InformationalVersion="$(informationalVersion)" -p:Version="$(majorMinorPatch)" -warnaserror -f ${{parameters.targetBuildFramework}}'
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+- ${{ if eq(parameters.unitTest, 'true') }}:
+  - task: DotNetCoreCLI@2
+    displayName: 'dotnet test'
+    inputs:
+      command: test
+      projects: '**/*UnitTests/*.csproj'
+      arguments: '--configuration $(buildConfiguration) --no-build -f ${{parameters.targetBuildFramework}} -- --retry-failed-tests 3 --report-trx'
+      testRunTitle: 'Unit Tests'
+
+- ${{ if eq(parameters.codeCoverage, 'true') }}:
+  - task: DotNetCoreCLI@2
+    displayName: 'dotnet test with coverage'
+    inputs:
+      command: test
+      projects: '**/*UnitTests/*.csproj'
+      arguments: '--configuration $(buildConfiguration) --no-build -f ${{parameters.targetBuildFramework}} -- --retry-failed-tests 3 --coverage --coverage-output-format cobertura --coverage-settings "$(System.DefaultWorkingDirectory)/CodeCoverage.Mtp.settings.xml" --report-trx'
+      testRunTitle: 'Unit Tests'
+      # Disable the task's built-in (non-retry-aware) result publishing so the
+      # explicit retry-aware PublishTestResults@2 task below is the sole publisher.
+      publishTestResults: false
+    env:
+      platformOptions__resultDirectory: '$(Agent.TempDirectory)/coverage'
+  - task: PublishTestResults@2
+    displayName: 'Publish unit test results'
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: 'VSTest'
+      testResultsFiles: '$(Agent.TempDirectory)/coverage/**/*.trx'
+      mergeTestResults: true
+      testRunTitle: 'Unit Tests'
+      failTaskOnFailedTests: true
+  - task: reportgenerator@5
+    displayName: 'aggregate unit test coverage'
+    condition: succeededOrFailed()
+    inputs:
+      reports: '$(Agent.TempDirectory)/coverage/**/*.cobertura.xml'
+      reporttypes: 'Cobertura'
+      targetdir: '$(Agent.TempDirectory)/coverage-aggregated'
+  
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish unit test coverage artifact'
+    condition: succeededOrFailed()
+    inputs:
+      pathToPublish: '$(Agent.TempDirectory)/coverage-aggregated'
+      artifactName: 'Coverage_UnitTests'
+      artifactType: 'container'
+
+- ${{ if eq(parameters.packageArtifacts, 'true') }}:
+  # https://eng.ms/docs/cloud-ai-platform/devdiv/one-engineering-system-1es/1es-docs/secure-supply-chain/ado-sbom-generator
+  - task: AzureArtifacts.manifest-generator-task.manifest-generator-task.ManifestGeneratorTask@0
+    displayName: 'SBOM Generation Task'
+    inputs:
+      BuildDropPath: '$(build.artifactStagingDirectory)'
+      BuildComponentPath: '$(Build.SourcesDirectory)'
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish SBOM Artifacts'
+    inputs:
+      pathToPublish: '$(build.artifactStagingDirectory)'
+      artifactName: 'deploy'
+      artifactType: 'container'
+
+- ${{ if eq(parameters.packageArtifacts, 'true') }}:
+  - template: package.yml
+
+- ${{ if eq(parameters.packageIntegrationTests, 'true') }}:
+  - template: package-integration-tests.yml

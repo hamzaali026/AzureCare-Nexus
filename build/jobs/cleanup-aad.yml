@@ -1,0 +1,69 @@
+jobs:
+- job: cleanupAad
+  displayName: 'Cleanup AAD'
+  pool:
+    name: '$(AzurePipelinesPool)'
+    vmImage: '$(LinuxVmImage)'
+  steps:
+  - task: AzureKeyVault@1
+    displayName: 'Azure Key Vault: resolute-oss-tenant-info'
+    inputs:
+      azureSubscription: $(ConnectedServiceName)
+      KeyVaultName: 'resolute-oss-tenant-info'
+
+  - task: PowerShell@2
+    displayName: 'Delete AAD apps'
+    retryCountOnTaskFailure: 1
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        # Install and import required Microsoft Graph modules
+        # IMPORTANT: Using PowerShell@2 instead of AzurePowerShell@5 to avoid assembly loading conflicts.
+        # AzurePowerShell@5 pre-loads Az.Accounts before our script runs, which causes conflicts with
+        # Microsoft.Graph.Authentication due to different versions of System.Threading.Tasks.Extensions.dll
+        # See: https://github.com/microsoftgraph/msgraph-sdk-powershell/issues/3479
+        $graphModules = @(
+          'Microsoft.Graph.Authentication',
+          'Microsoft.Graph.Applications',
+          'Microsoft.Graph.Users',
+          'Microsoft.Graph.Identity.DirectoryManagement'
+        )
+
+        # Pin all Graph submodules to a single version so the installed and imported set always
+        # match (floating to "latest" independently, or importing a stale copy pre-baked on the
+        # agent, can produce a mismatched set that fails Connect-MgGraph with EntryPointNotFoundException).
+        $graphVersion = '2.33.0'
+
+        # Install all modules first at the pinned version
+        foreach ($module in $graphModules) {
+          $installed = Get-Module -ListAvailable -Name $module | Where-Object { $_.Version -eq $graphVersion } | Select-Object -First 1
+          if (-not $installed) {
+            Install-Module -Name $module -RequiredVersion $graphVersion -Scope CurrentUser -Force -AllowClobber
+          }
+        }
+
+        # Import all modules upfront to prevent auto-loading conflicts
+        foreach ($module in $graphModules) {
+          Import-Module -Name $module -RequiredVersion $graphVersion -ErrorAction Stop
+        }
+
+        $installedAuth = Get-Module -Name Microsoft.Graph.Authentication | Select-Object -First 1
+        Write-Host "Microsoft.Graph.Authentication version: $($installedAuth.Version)"
+
+        $username = "$(tenant-admin-user-name)"
+        $clientId = "$(tenant-admin-service-principal-name)"
+        $clientSecret = "$(tenant-admin-service-principal-password)"
+        $clientSecret_secure =  ConvertTo-SecureString -AsPlainText $clientSecret -Force
+        $tenantId = "$(tenant-id)"
+
+        # Create PSCredential for Microsoft Graph authentication
+        $clientSecretCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $clientId, $clientSecret_secure
+
+        # Connect to Microsoft Graph using client credentials
+        Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $clientSecretCredential -NoWelcome
+
+        Import-Module $(System.DefaultWorkingDirectory)/samples/scripts/PowerShell/FhirServer/FhirServer.psd1
+        Import-Module $(System.DefaultWorkingDirectory)/release/scripts/PowerShell/FhirServerRelease/FhirServerRelease.psd1
+
+        Remove-AadTestAuthEnvironment -TestAuthEnvironmentPath $(System.DefaultWorkingDirectory)/testauthenvironment.json -EnvironmentName $(DeploymentEnvironmentName) -TenantId $tenantId -ClientId $clientId -ClientSecret $clientSecret_secure

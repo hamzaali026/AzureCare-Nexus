@@ -1,0 +1,103 @@
+steps:
+- task: AzureKeyVault@1
+  displayName: 'Azure Key Vault: resolute-oss-tenant-info'
+  inputs:
+    azureSubscription: $(ConnectedServiceName)
+    KeyVaultName: 'resolute-oss-tenant-info'
+
+- task: AzureCLI@2
+  displayName: Setup AAD Test Environment
+  retryCountOnTaskFailure: 1
+  inputs:
+    azureSubscription: $(ConnectedServiceName)
+    scriptType: pscore
+    scriptLocation: inlineScript
+    addSpnToEnvironment: true
+    inlineScript: |
+      # IMPORTANT: Using AzureCLI@2 with pscore and importing Microsoft.Graph modules BEFORE Az modules
+      # to avoid assembly loading conflicts with System.Threading.Tasks.Extensions.dll
+      # See: https://github.com/microsoftgraph/msgraph-sdk-powershell/issues/3479
+      
+      # Install and import Microsoft Graph modules FIRST (order matters!)
+      $graphModules = @(
+        'Microsoft.Graph.Authentication',
+        'Microsoft.Graph.Applications',
+        'Microsoft.Graph.Users',
+        'Microsoft.Graph.Identity.DirectoryManagement'
+      )
+
+      # Pin all Graph submodules to a single version so the installed and imported set always match
+      # (floating to "latest" independently, or importing a stale copy pre-baked on the agent, can
+      # produce a mismatched set and fail Connect-MgGraph with EntryPointNotFoundException).
+      $graphVersion = '2.38.0'
+
+      Write-Host "Installing Microsoft Graph modules (version $graphVersion)..."
+      $graphModules | ForEach-Object { Install-Module -Name $_ -RequiredVersion $graphVersion -Force -Scope CurrentUser -AllowClobber }
+
+      Write-Host "Importing Microsoft Graph modules (version $graphVersion)..."
+      $graphModules | ForEach-Object { Import-Module -Name $_ -RequiredVersion $graphVersion -ErrorAction Stop }
+
+      $graphAuthModule = Get-Module -Name Microsoft.Graph.Authentication | Select-Object -First 1
+      Write-Host "Microsoft.Graph.Authentication version: $($graphAuthModule.Version)"
+
+      # Install and import Az modules AFTER Microsoft.Graph modules are loaded.
+      # Pin Az.Accounts / Az.KeyVault to 5.5.0 / 6.5.0. Two separate assembly conflicts are in play:
+      #   1. Az.Accounts 5.5.1 (published 2026-07-07) ships a shared assembly that breaks
+      #      Connect-MgGraph with EntryPointNotFoundException, so we must load 5.5.0 (not 5.5.1).
+      #   2. SecretManagement's Register-SecretVault (called later in Add-AadTestAuthEnvironment.ps1)
+      #      resolves Az.KeyVault to the HIGHEST installed version. The hosted agent image also ships
+      #      Az.KeyVault 6.5.1 / Az.Accounts 5.5.1, so it would pick 6.5.1 and fail with
+      #      "Assembly with same name is already loaded" against the pinned 5.5.0/6.5.0 we loaded.
+      # Fix: pin to 5.5.0/6.5.0 AND remove any higher versions from the module path so the whole
+      # process (Connect-MgGraph and Register-SecretVault alike) only ever sees the pinned build.
+      $azAccountsVersion = '5.5.0'
+      $azKeyVaultVersion = '6.5.0'
+      Write-Host "Installing Az modules (Az.Accounts $azAccountsVersion, Az.KeyVault $azKeyVaultVersion)..."
+      Install-Module -Name Az.Accounts -RequiredVersion $azAccountsVersion -Force -Scope CurrentUser -AllowClobber
+      Install-Module -Name Az.KeyVault -RequiredVersion $azKeyVaultVersion -Force -Scope CurrentUser -AllowClobber
+      Install-Module -Name Microsoft.PowerShell.SecretManagement -Force -Scope CurrentUser -AllowClobber
+
+      # Remove any Az.Accounts / Az.KeyVault versions newer than the pin (shipped by the agent image),
+      # so Register-SecretVault cannot auto-resolve to a newer build whose shared assembly conflicts.
+      $azPins = @{ 'Az.Accounts' = [version]$azAccountsVersion; 'Az.KeyVault' = [version]$azKeyVaultVersion }
+      foreach ($azName in $azPins.Keys) {
+        Get-Module -ListAvailable -Name $azName | Where-Object { $_.Version -gt $azPins[$azName] } | ForEach-Object {
+          Write-Host "Removing higher $azName $($_.Version) at $($_.ModuleBase) to avoid assembly conflict"
+          Remove-Item -LiteralPath $_.ModuleBase -Recurse -Force -ErrorAction SilentlyContinue
+        }
+      }
+
+      Import-Module Az.Accounts -RequiredVersion $azAccountsVersion -ErrorAction Stop
+      Import-Module Az.KeyVault -RequiredVersion $azKeyVaultVersion -ErrorAction Stop
+      Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
+
+      # Set up variables
+      $tenantId = "$(tenant-id)"
+      $graphClientId = "$(tenant-admin-service-principal-id)"
+      $graphClientSecret = ConvertTo-SecureString -AsPlainText "$(tenant-admin-service-principal-password)" -Force
+      $graphCredential = New-Object System.Management.Automation.PSCredential($graphClientId, $graphClientSecret)
+      $environmentName = "$(DeploymentEnvironmentName)".ToLower() -replace "\.", "" 
+      $keyVaultName = "$(KeyVaultBaseName)-ts".ToLower() -replace "\.", ""
+
+      # Connect to Microsoft Graph using tenant admin service principal
+      Write-Host "Connecting to Microsoft Graph..."
+      Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $graphCredential
+      
+      # Connect to Azure using the service connection (supports both WIF and secret-based auth)
+      Write-Host "Connecting to Azure..."
+      $azContext = az account show | ConvertFrom-Json
+      if ($env:idToken) {
+        Connect-AzAccount -ServicePrincipal -ApplicationId $env:servicePrincipalId -FederatedToken $env:idToken -Tenant $azContext.tenantId -Subscription $azContext.id
+      } elseif ($env:servicePrincipalKey) {
+        $azCredential = New-Object System.Management.Automation.PSCredential($env:servicePrincipalId, (ConvertTo-SecureString $env:servicePrincipalKey -AsPlainText -Force))
+        Connect-AzAccount -ServicePrincipal -Credential $azCredential -Tenant $azContext.tenantId -Subscription $azContext.id
+      } else {
+        throw "No valid Azure credentials found. Ensure the service connection is configured correctly."
+      }
+
+      # Import FHIR modules and run setup
+      Import-Module $(System.DefaultWorkingDirectory)/samples/scripts/PowerShell/FhirServer/FhirServer.psd1
+      Import-Module $(System.DefaultWorkingDirectory)/release/scripts/PowerShell/FhirServerRelease/FhirServerRelease.psd1
+
+      Write-Host "Setting up AAD Test Environment..."
+      Add-AadTestAuthEnvironment -TestAuthEnvironmentPath $(System.DefaultWorkingDirectory)/testauthenvironment.json -EnvironmentName $environmentName -KeyVaultName $keyVaultName -ResourceGroupName $(UniqueResourceGroupName) -EnvironmentLocation $(ResourceGroupRegion) -TenantAdminCredential $graphCredential -TenantId $tenantId -ClientId $graphClientId -ClientSecret $graphClientSecret

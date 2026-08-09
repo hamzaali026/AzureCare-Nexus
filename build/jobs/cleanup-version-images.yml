@@ -1,0 +1,74 @@
+parameters:
+- name: version
+  type: string
+
+jobs:
+- job: deleteImage
+  displayName: "Delete ${{ parameters.version }} Images"
+  pool:
+    name: '$(AzurePipelinesPool)'
+    vmImage: '$(LinuxVmImage)'
+  steps:
+    - task: AzureCLI@2
+      displayName: 'Delete Images'
+      inputs:
+        azureSubscription: $(ConnectedServiceName)
+        scriptType: pscore
+        scriptLocation: InlineScript
+        inlineScript: |
+          $version = "${{ parameters.version }}"
+        
+          Write-Host "Untagging ${version} images"
+          $repository = "${version}_fhir-server"
+          $tagList = az acr repository show-tags --name $(azureContainerRegistryName) --repository $repository | ConvertFrom-Json
+
+          foreach ($tag in $tagList) {
+            $tagParts = $tag.Split('-')
+              try {
+                $imageName = "${repository}:${tag}"
+                $imageDate = az acr repository show --name $(azureContainerRegistryName) --image $imageName | ConvertFrom-Json
+                $currentDate = Get-Date
+                $difference = New-TimeSpan -Start $imageDate.lastUpdateTime -End $currentDate
+
+                if (($tagParts[0] -notlike "*build*") -and (($difference.totalDays -gt 60) -or (($difference.totalDays -gt 7) -and ($tagParts[0] -like "*-pr*")))) {
+                  az acr repository untag --name $(azureContainerRegistryName) --image "${version}_fhir-server:${tag}"
+                }
+              }
+              catch {
+                Write-Host "Error deleting tag ${tag} in ${version} repository"
+              }
+          }
+
+          Write-Host "Removing orphaned untagged ${version} images"
+          $repository = "${version}_fhir-server"
+
+          # Step 1: Collect all digests referenced by tagged manifests (multi-arch index children)
+          $referencedDigests = @{}
+          $taggedManifests = az acr repository show-manifests --name $(azureContainerRegistryName) --repository $repository --query "[?tags[0]!=null]" -o json | ConvertFrom-Json
+          foreach ($tagged in $taggedManifests) {
+              try {
+                  $manifest = az acr manifest show --name $repository --registry $(azureContainerRegistryName) --digest $tagged.digest -o json 2>$null | ConvertFrom-Json
+                  if ($manifest.manifests) {
+                      # This is a multi-arch index; record all child digests
+                      foreach ($child in $manifest.manifests) {
+                          $referencedDigests[$child.digest] = $tagged.digest
+                          Write-Host "  Protected child manifest $($child.digest) (referenced by $($tagged.tags -join ', '))"
+                      }
+                  }
+              }
+              catch {
+                  Write-Host "  Warning: Could not inspect manifest $($tagged.digest)"
+              }
+          }
+
+          # Step 2: Delete only truly orphaned untagged manifests
+          $untaggedDigests = az acr repository show-manifests --name $(azureContainerRegistryName) --repository $repository --query "[?tags[0]==null].digest" -o tsv
+          foreach ($digest in $untaggedDigests) {
+              if ($referencedDigests.ContainsKey($digest)) {
+                  Write-Host "  Skipping $digest (referenced by tagged index $($referencedDigests[$digest]))"
+              }
+              else {
+                  Write-Host "  Deleting orphaned manifest $digest"
+                  az acr repository delete --name $(azureContainerRegistryName) --image "${repository}@${digest}" --yes
+              }
+          }

@@ -1,0 +1,25 @@
+jobs:
+- job: DeleteResourceGroup
+  displayName: 'Delete resource group'
+  pool:
+    name: '$(InternalPool)'
+    demands:
+      - ImageOverride -equals $(InternalLinuxImage)
+  steps:
+  - task: AzurePowerShell@5
+    displayName: 'Delete resource group'
+    inputs:
+      azureSubscription: $(ConnectedServiceName)
+      azurePowerShellVersion: latestVersion
+      pwsh: true
+      ScriptType: InlineScript
+      Inline: |
+        Get-AzResourceGroup -Name $(ResourceGroupName) -ErrorVariable notPresent -ErrorAction SilentlyContinue 
+        if ($notPresent) {
+          Write-Host "Resource group $(ResourceGroupName) not found"
+        } else {
+          Write-Host "Deleting resource group $(ResourceGroupName)"
+          Remove-AzResourceGroup -Name $(ResourceGroupName) -Force -Verbose
+        }
+
+- template: ./cleanup-aad.yml

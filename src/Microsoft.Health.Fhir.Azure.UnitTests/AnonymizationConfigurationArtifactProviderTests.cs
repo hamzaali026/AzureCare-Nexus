@@ -1,0 +1,419 @@
+﻿// -------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
+// -------------------------------------------------------------------------------------------------
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Storage.Blobs;
+using Microsoft.Azure.ContainerRegistry;
+using Microsoft.Azure.ContainerRegistry.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Microsoft.Health.Fhir.Azure.ExportDestinationClient;
+using Microsoft.Health.Fhir.Core.Configs;
+using Microsoft.Health.Fhir.Core.Features.Operations.ConvertData;
+using Microsoft.Health.Fhir.Core.Features.Operations.Export;
+using Microsoft.Health.Fhir.Core.Features.Operations.Export.ExportDestinationClient;
+using Microsoft.Health.Fhir.Core.Features.Operations.Export.Models;
+using Microsoft.Health.Fhir.TemplateManagement.Exceptions;
+using Microsoft.Health.Fhir.TemplateManagement.Utilities;
+using Microsoft.Health.Fhir.Tests.Common;
+using Microsoft.Health.Test.Utilities;
+using Microsoft.Rest;
+using NSubstitute;
+using Xunit;
+
+namespace Microsoft.Health.Fhir.Azure.UnitTests
+{
+    [Trait(Traits.OwningTeam, OwningTeam.FhirImport)]
+    [Trait(Traits.Category, Categories.AnonymizedExport)]
+    public class AnonymizationConfigurationArtifactProviderTests
+    {
+        private AnonymizationConfigurationArtifactProvider _provider;
+
+        private const string TestRepositoryName = "testanonymizationconfigs";
+        private const string TestConfigName = "testconfigname.json";
+        private const string TestRepositoryTag = "unittest";
+
+        private const string AnonymizationConfiguration = @"
+{
+    ""fhirPathRules"": [
+        {""path"": ""Resource.nodesByName('id')"", ""method"": ""redact""},
+        {""path"": ""nodesByType('Human').name"", ""method"": ""redact""}
+    ]
+}";
+
+        public AnonymizationConfigurationArtifactProviderTests()
+        {
+            var registry = GetTestContainerRegistryInfo();
+
+            // Use basic token here, which can work when there is no Managed Identity for container registry token.
+            AcrBasicToken acrTokenProvider = new AcrBasicToken(registry);
+            var exportJobConfiguration = new ExportJobConfiguration();
+            IOptions<ExportJobConfiguration> optionsExportConfig = Substitute.For<IOptions<ExportJobConfiguration>>();
+            optionsExportConfig.Value.Returns(exportJobConfiguration);
+            var logger = Substitute.For<ILogger<AzureConnectionStringClientInitializer>>();
+            var azureAccessTokenClientInitializer = new AzureConnectionStringClientInitializer(optionsExportConfig, logger);
+            _provider = new AnonymizationConfigurationArtifactProvider(azureAccessTokenClientInitializer, acrTokenProvider, optionsExportConfig, new NullLogger<AnonymizationConfigurationArtifactProvider>());
+        }
+
+        [Fact]
+        public void GivenNullExportClientInitializer_WhenCreatingProvider_ThenThrowsArgumentNullException()
+        {
+            // Arrange
+            var tokenProvider = Substitute.For<IContainerRegistryTokenProvider>();
+            var config = Options.Create(new ExportJobConfiguration());
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(() =>
+                new AnonymizationConfigurationArtifactProvider(null, tokenProvider, config, logger));
+        }
+
+        [Fact]
+        public void GivenNullTokenProvider_WhenCreatingProvider_ThenThrowsArgumentNullException()
+        {
+            // Arrange
+            var clientInitializer = Substitute.For<IExportClientInitializer<BlobServiceClient>>();
+            var config = Options.Create(new ExportJobConfiguration());
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(() =>
+                new AnonymizationConfigurationArtifactProvider(clientInitializer, null, config, logger));
+        }
+
+        [Fact]
+        public void GivenNullConfiguration_WhenCreatingProvider_ThenThrowsArgumentNullException()
+        {
+            // Arrange
+            var clientInitializer = Substitute.For<IExportClientInitializer<BlobServiceClient>>();
+            var tokenProvider = Substitute.For<IContainerRegistryTokenProvider>();
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(() =>
+                new AnonymizationConfigurationArtifactProvider(clientInitializer, tokenProvider, null, logger));
+        }
+
+        [Fact]
+        public void GivenValidParameters_WhenCreatingProvider_ThenProviderIsCreated()
+        {
+            // Arrange
+            var clientInitializer = Substitute.For<IExportClientInitializer<BlobServiceClient>>();
+            var tokenProvider = Substitute.For<IContainerRegistryTokenProvider>();
+            var config = Options.Create(new ExportJobConfiguration());
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+
+            // Act
+            using var provider = new AnonymizationConfigurationArtifactProvider(clientInitializer, tokenProvider, config, logger);
+
+            // Assert
+            Assert.NotNull(provider);
+        }
+
+        [Fact]
+        public async Task GivenEmptyConfigurationLocation_WhenFetchingAsync_ThenThrowsArgumentException()
+        {
+            // Arrange
+            var jobRecord = new ExportJobRecord(
+                new Uri("https://localhost/$export"),
+                ExportJobType.All,
+                "Dummy",
+                resourceType: null,
+                filters: null,
+                "hash",
+                rollingFileSizeInMB: 1,
+                anonymizationConfigurationLocation: string.Empty);
+            using var stream = new MemoryStream();
+
+            // Act & Assert
+            await Assert.ThrowsAsync<ArgumentException>(() => _provider.FetchAsync(jobRecord, stream, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task GivenNullJobRecord_WhenFetchingAsync_ThenThrowsNullReferenceException()
+        {
+            // Arrange
+            using var stream = new MemoryStream();
+
+            // Act & Assert
+            await Assert.ThrowsAsync<NullReferenceException>(() => _provider.FetchAsync(null, stream, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task GivenNullTargetStream_WhenFetchingAsync_ThenThrowsArgumentNullException()
+        {
+            // Arrange
+            var jobRecord = new ExportJobRecord(
+                new Uri("https://localhost/$export"),
+                ExportJobType.All,
+                "Dummy",
+                resourceType: null,
+                filters: null,
+                "hash",
+                rollingFileSizeInMB: 1,
+                anonymizationConfigurationLocation: "config.json");
+
+            // Act & Assert
+            await Assert.ThrowsAsync<ArgumentNullException>(() => _provider.FetchAsync(jobRecord, null, CancellationToken.None));
+        }
+
+        [Fact]
+        public void GivenProviderCreated_WhenDisposed_ThenCanBeDisposedMultipleTimes()
+        {
+            // Arrange
+            var clientInitializer = Substitute.For<IExportClientInitializer<BlobServiceClient>>();
+            var tokenProvider = Substitute.For<IContainerRegistryTokenProvider>();
+            var config = Options.Create(new ExportJobConfiguration());
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+            using var provider = new AnonymizationConfigurationArtifactProvider(clientInitializer, tokenProvider, config, logger);
+
+            // Act & Assert - Should not throw when disposed multiple times
+            provider.Dispose();
+            provider.Dispose(); // Dispose again
+        }
+
+        [Fact]
+        public async Task GivenJobRecordWithoutAcrReference_WhenFetchingAsync_ThenUsesBlobStoragePath()
+        {
+            // Arrange
+            var clientInitializer = Substitute.For<IExportClientInitializer<BlobServiceClient>>();
+            var tokenProvider = Substitute.For<IContainerRegistryTokenProvider>();
+            var config = Options.Create(new ExportJobConfiguration());
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+
+            var jobRecord = new ExportJobRecord(
+                new Uri("https://localhost/$export"),
+                ExportJobType.All,
+                "Dummy",
+                resourceType: null,
+                filters: null,
+                "hash",
+                rollingFileSizeInMB: 1,
+                anonymizationConfigurationCollectionReference: null, // No ACR reference
+                anonymizationConfigurationLocation: "config.json");
+
+            using var provider = new AnonymizationConfigurationArtifactProvider(clientInitializer, tokenProvider, config, logger);
+            using var stream = new MemoryStream();
+
+            // Act & Assert - Will attempt to use blob storage path and fail since we don't have real blob infrastructure
+            // This test verifies the code path selection logic
+            await Assert.ThrowsAnyAsync<Exception>(() => provider.FetchAsync(jobRecord, stream, CancellationToken.None));
+
+            // Verify that GetAuthorizedClient was called (blob storage path)
+            clientInitializer.Received(1).GetAuthorizedClient(Arg.Any<ExportJobConfiguration>());
+        }
+
+        [Fact]
+        public async Task GivenJobRecordWithAcrReference_WhenFetchingAsync_ThenUsesAcrPath()
+        {
+            // Arrange
+            var clientInitializer = Substitute.For<IExportClientInitializer<BlobServiceClient>>();
+            var tokenProvider = Substitute.For<IContainerRegistryTokenProvider>();
+            tokenProvider.GetTokenAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns("Bearer test-token");
+
+            var config = Options.Create(new ExportJobConfiguration());
+            var logger = new NullLogger<AnonymizationConfigurationArtifactProvider>();
+
+            var jobRecord = new ExportJobRecord(
+                new Uri("https://localhost/$export"),
+                ExportJobType.All,
+                "Dummy",
+                resourceType: null,
+                filters: null,
+                "hash",
+                rollingFileSizeInMB: 1,
+                anonymizationConfigurationCollectionReference: "test.azurecr.io/repo:tag", // ACR reference present
+                anonymizationConfigurationLocation: "config.json");
+
+            using var provider = new AnonymizationConfigurationArtifactProvider(clientInitializer, tokenProvider, config, logger);
+            using var stream = new MemoryStream();
+
+            // Act & Assert - Will attempt to use ACR path and fail since we don't have real ACR
+            // This test verifies the code path selection logic
+            await Assert.ThrowsAnyAsync<Exception>(() => provider.FetchAsync(jobRecord, stream, CancellationToken.None));
+
+            // Verify that token provider was called (ACR path)
+            await tokenProvider.Received(1).GetTokenAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        }
+
+        [SkippableFact]
+        public async Task GivenAValidConfigName_WithValidAcrReference_WhenFetchAnonymizedConfig_TheConfigContentInAcrShouldBeRerturn()
+        {
+            var registry = GetTestContainerRegistryInfo();
+
+            // Skip when there is no registry configuration
+            Skip.If(registry == null);
+
+            await PushConfigurationAsync(registry, TestRepositoryName, TestRepositoryTag, AnonymizationConfiguration);
+            var jobRecord = new ExportJobRecord(
+                new Uri("https://localhost/$export"),
+                ExportJobType.All,
+                "Dummy",
+                resourceType: null,
+                filters: null,
+                "hash",
+                rollingFileSizeInMB: 1,
+                anonymizationConfigurationCollectionReference: $"{registry.Server}/{TestRepositoryName}:{TestRepositoryTag}",
+                anonymizationConfigurationLocation: TestConfigName);
+            using (Stream stream = new MemoryStream())
+            {
+                await _provider.FetchAsync(jobRecord, stream, CancellationToken.None);
+                stream.Position = 0;
+                using (StreamReader reader = new StreamReader(stream))
+                {
+                    string configurationContent = await reader.ReadToEndAsync();
+                    Assert.Contains("Resource.nodesByName('id')", configurationContent);
+                }
+            }
+        }
+
+        [SkippableFact]
+        public async Task GivenAValidAcrReference_WithInvalidConfigName_WhenFetchAnonymizedConfig_ExceptionShouldBeThrown()
+        {
+            var registry = GetTestContainerRegistryInfo();
+
+            // Skip when there is no registry configuration
+            Skip.If(registry == null);
+
+            await PushConfigurationAsync(registry, TestRepositoryName, TestRepositoryTag, AnonymizationConfiguration);
+            var jobRecord = new ExportJobRecord(
+                new Uri("https://localhost/$export"),
+                ExportJobType.All,
+                "Dummy",
+                resourceType: null,
+                filters: null,
+                "hash",
+                rollingFileSizeInMB: 1,
+                anonymizationConfigurationCollectionReference: $"{registry.Server}/{TestRepositoryName}:{TestRepositoryTag}",
+                anonymizationConfigurationLocation: "InvalidConfigName");
+            using (Stream stream = new MemoryStream())
+            {
+                await Assert.ThrowsAsync<FileNotFoundException>(() => _provider.FetchAsync(jobRecord, stream, CancellationToken.None));
+            }
+        }
+
+        private async Task PushConfigurationAsync(ContainerRegistryInfo registry, string repository, string tag, string configContent)
+        {
+            AzureContainerRegistryClient acrClient = new AzureContainerRegistryClient(registry.Server, new AcrBasicToken(registry));
+
+            int schemaV2 = 2;
+            string mediatypeV2Manifest = "application/vnd.docker.distribution.manifest.v2+json";
+            string mediatypeV1Manifest = "application/vnd.oci.image.config.v1+json";
+            string emptyConfigStr = "{}";
+
+            // Upload config blob
+            byte[] originalConfigBytes = Encoding.UTF8.GetBytes(emptyConfigStr);
+            using var originalConfigStream = new MemoryStream(originalConfigBytes);
+            string originalConfigDigest = ComputeDigest(originalConfigStream);
+            await UploadBlob(acrClient, originalConfigStream, repository, originalConfigDigest);
+
+            // Upload memory blob
+            byte[] configContentBytes = Encoding.UTF8.GetBytes(configContent);
+
+            configContentBytes = StreamUtility.CompressToTarGz(new Dictionary<string, byte[]>() { { TestConfigName, configContentBytes } }, false);
+            using Stream byteStream = new MemoryStream(configContentBytes);
+            var blobLength = byteStream.Length;
+            string blobDigest = ComputeDigest(byteStream);
+            await UploadBlob(acrClient, byteStream, repository, blobDigest);
+
+            // Push manifest
+            List<Descriptor> layers = new List<Descriptor>
+            {
+                new Descriptor("application/vnd.oci.image.layer.v1.tar", blobLength, blobDigest),
+            };
+            var v2Manifest = new V2Manifest(schemaV2, mediatypeV2Manifest, new Descriptor(mediatypeV1Manifest, originalConfigBytes.Length, originalConfigDigest), layers);
+            await acrClient.Manifests.CreateAsync(repository, tag, v2Manifest);
+            acrClient.Dispose();
+        }
+
+        private static string ComputeDigest(Stream s)
+        {
+            s.Position = 0;
+            StringBuilder sb = new StringBuilder();
+
+            using (var hash = SHA256.Create())
+            {
+                byte[] result = hash.ComputeHash(s);
+                foreach (byte b in result)
+                {
+                    sb.Append(b.ToString("x2"));
+                }
+            }
+
+            return "sha256:" + sb.ToString();
+        }
+
+        private async Task UploadBlob(AzureContainerRegistryClient acrClient, Stream stream, string repository, string digest)
+        {
+            stream.Position = 0;
+            var uploadInfo = await acrClient.Blob.StartUploadAsync(repository);
+            var uploadedLayer = await acrClient.Blob.UploadAsync(stream, uploadInfo.Location);
+            await acrClient.Blob.EndUploadAsync(digest, uploadedLayer.Location);
+        }
+
+        private ContainerRegistryInfo GetTestContainerRegistryInfo()
+        {
+            var containerRegistry = new ContainerRegistryInfo
+            {
+                Server = EnvironmentVariables.GetEnvironmentVariable(KnownEnvironmentVariableNames.TestContainerRegistryServer),
+                Username = EnvironmentVariables.GetEnvironmentVariable(KnownEnvironmentVariableNames.TestContainerRegistryServer)?.Split('.')[0],
+                Password = EnvironmentVariables.GetEnvironmentVariable(KnownEnvironmentVariableNames.TestContainerRegistryPassword),
+            };
+
+            if (string.IsNullOrEmpty(containerRegistry.Server) || string.IsNullOrEmpty(containerRegistry.Password))
+            {
+                return null;
+            }
+
+            return containerRegistry;
+        }
+
+        internal class AcrBasicToken : ServiceClientCredentials, IContainerRegistryTokenProvider
+        {
+            private ContainerRegistryInfo _registry;
+
+            public AcrBasicToken(ContainerRegistryInfo registry)
+            {
+                _registry = registry;
+            }
+
+            public Task<string> GetTokenAsync(string registryServer, CancellationToken cancellationToken)
+            {
+                return Task.FromResult("Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_registry.Username}:{_registry.Password}")));
+            }
+
+            public override void InitializeServiceClient<T>(ServiceClient<T> client)
+            {
+                base.InitializeServiceClient(client);
+            }
+
+            public override Task ProcessHttpRequestAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                var basicToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_registry.Username}:{_registry.Password}"));
+                request.Headers.Authorization = new AuthenticationHeaderValue("Basic", basicToken);
+                return base.ProcessHttpRequestAsync(request, cancellationToken);
+            }
+        }
+
+        internal class ContainerRegistryInfo
+        {
+            public string Server { get; set; }
+
+            public string Username { get; set; }
+
+            public string Password { get; set; }
+        }
+    }
+}

@@ -1,0 +1,188 @@
+﻿// -------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
+// -------------------------------------------------------------------------------------------------
+
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Hl7.Fhir.Model;
+using Microsoft.Health.Fhir.Tests.Common;
+using Microsoft.Health.Fhir.Tests.Common.FixtureParameters;
+using Microsoft.Health.Test.Utilities;
+using Xunit;
+using Task = System.Threading.Tasks.Task;
+
+namespace Microsoft.Health.Fhir.Tests.E2E.Rest.Search
+{
+    [Trait(Traits.OwningTeam, OwningTeam.Fhir)]
+    [Trait(Traits.Category, Categories.Search)]
+    [HttpIntegrationFixtureArgumentSets(DataStore.All, Format.Json)]
+    public class TokenSearchTests : SearchTestsBase<TokenSearchTestFixture>
+    {
+        public static readonly object[][] TokenSearchParameterData = new[]
+        {
+            new object[] { "a" },
+            new object[] { "code1", 0, 5, 6 },
+            new object[] { "code3", 4, 6, 7 },
+            new object[] { "a|b" },
+            new object[] { "system2|code2", 1 },
+            new object[] { "|code2" },
+            new object[] { "|code3", 7 },
+            new object[] { "a|" },
+            new object[] { "system3|", 4, 5, 6 },
+            new object[] { "code1,system2|code2", 0, 1, 5, 6 },
+        };
+
+        public TokenSearchTests(TokenSearchTestFixture fixture)
+            : base(fixture)
+        {
+        }
+
+        [Theory]
+        [MemberData(nameof(TokenSearchParameterData))]
+        public async Task GivenATokenSearchParameter_WhenSearched_ThenCorrectBundleShouldBeReturned(string queryValue, params int[] expectedIndices)
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&value-concept={queryValue}");
+
+            Observation[] expected = expectedIndices.Select(i => Fixture.Observations[i]).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Theory]
+        [InlineData("code1")]
+        [InlineData("text", 2, 3, 4, 5, 6)]
+        [InlineData("text2", 3, 6)]
+        public async Task GivenATokenSearchParameterWithTextModifier_WhenSearched_ThenCorrectBundleShouldBeReturned(string queryValue, params int[] expectedIndices)
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&value-concept:text={queryValue}");
+
+            Observation[] expected = expectedIndices.Select(i => Fixture.Observations[i]).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Theory]
+        [MemberData(nameof(TokenSearchParameterData))]
+        public async Task GivenATokenSearchParameterWithNotModifier_WhenSearched_ThenCorrectBundleShouldBeReturned(string queryValue, params int[] excludeIndices)
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&value-concept:not={queryValue}");
+
+            Observation[] expected = Fixture.Observations.Where((_, i) => !excludeIndices.Contains(i)).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Fact]
+        public async Task GivenATokenSearchParameterWithNotModifier_WhenSearchedOverMissingValue_ThenCorrectBundleShouldBeReturned()
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&category:not=test");
+
+            Observation[] expected = Fixture.Observations.Where((_, i) => i != 8).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Theory]
+        [InlineData("code1", 0, 5, 6, 8)]
+        public async Task GivenMultipleTokenSearchParametersWithNotModifiers_WhenSearched_ThenCorrectBundleShouldBeReturned(string queryValue, params int[] excludeIndices)
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&category:not=test&value-concept:not={queryValue}");
+
+            Observation[] expected = Fixture.Observations.Where((_, i) => !excludeIndices.Contains(i)).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public async Task GivenIdWithNotModifier_WhenSearched_ThenCorrectBundleShouldBeReturned(int count)
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&_id:not={string.Join(",", Fixture.Observations.Take(count).Select(x => x.Id))}");
+
+            Observation[] expected = Fixture.Observations.Skip(count).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Theory]
+        [InlineData(ResourceType.Patient)]
+        [InlineData(ResourceType.Patient, ResourceType.Organization)]
+        public async Task GivenTypeWithNotModifier_WhenSearched_ThenCorrectBundleShouldBeReturned(params ResourceType[] resourceTypes)
+        {
+            Bundle bundle = await Client.SearchAsync($"?_tag={Fixture.Tag}&_type:not={string.Join(",", resourceTypes)}");
+
+            ValidateBundle(bundle, Fixture.Observations.ToArray());
+        }
+
+        [Theory]
+        [MemberData(nameof(TokenSearchParameterData))]
+        public async Task GivenATokenSearchParameterWithNotModifier_WhenSearchedWithType_ThenCorrectBundleShouldBeReturned(string queryValue, params int[] excludeIndices)
+        {
+            Bundle bundle = await Client.SearchAsync($"?_tag={Fixture.Tag}&_type={ResourceType.Observation}&value-concept:not={queryValue}");
+
+            Observation[] expected = Fixture.Observations.Where((_, i) => !excludeIndices.Contains(i)).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Theory]
+        [InlineData("VALUE")]
+        [InlineData("value")]
+        public async Task GivenATokenSearchParameterWithTwoValuesThatOnlyDifferInCase_WhenSearchedByEitherValue_ThenTheResourceWillBeReturned(string queryValue)
+        {
+            Bundle bundle = await Client.SearchAsync(ResourceType.Observation, $"_tag={Fixture.Tag}&identifier={queryValue}");
+
+            Observation[] expected = Fixture.Observations.Where((_, i) => _.Identifier.Any((id) => id.Value == queryValue)).ToArray();
+
+            ValidateBundle(bundle, expected);
+        }
+
+        [Fact]
+        public async Task GivenIdentifierQuery_WhenSearched_ThenResourceIsReturned()
+        {
+            // FYI cannot use tags because otherwise token stored procedure will not be called
+            var id = "system.only.id";
+            var system = "http://system.only.org";
+            var identifier = "system.only.identifier";
+            await Client.UpdateAsync(new Patient { Id = id, Identifier = [new Identifier(system, identifier)] });
+
+            // search by system only
+            var bundle = await Client.SearchAsync(ResourceType.Patient, $"identifier={system}|");
+            var cnt = bundle.Resource.Entry.Count;
+            Assert.True(cnt == 1, $"total count: expected=1 actual={cnt}");
+            cnt = bundle.Resource.Entry.Count(_ => _.Resource.Id == id);
+            Assert.True(cnt == 1, $"count with specific id: expected=1 actual={cnt}");
+
+            // search by both system and code
+            bundle = await Client.SearchAsync(ResourceType.Patient, $"identifier={system}|{identifier}");
+            cnt = bundle.Resource.Entry.Count;
+            Assert.True(cnt == 1, $"total count: expected=1 actual={cnt}");
+            cnt = bundle.Resource.Entry.Count(_ => _.Resource.Id == id);
+            Assert.True(cnt == 1, $"count with specific id: expected=1 actual={cnt}");
+
+            // search by code only
+            bundle = await Client.SearchAsync(ResourceType.Patient, $"identifier={identifier}");
+            cnt = bundle.Resource.Entry.Count;
+            Assert.True(cnt == 1, $"total count: expected=1 actual={cnt}");
+            cnt = bundle.Resource.Entry.Count(_ => _.Resource.Id == id);
+            Assert.True(cnt == 1, $"count with specific id: expected=1 actual={cnt}");
+        }
+
+        [Fact]
+        public async Task GivenAPatient_WhenSoftDeleted_ThenDeceasedFalseCountShouldNotChange()
+        {
+            // A tag filter would hide an invalid Patient-deceased row left on the tombstone.
+            var countBefore = await Client.SearchAsync("Patient?deceased=false&_summary=count");
+
+            var createResponse = await Client.CreateAsync(new Patient());
+            await Client.DeleteAsync(createResponse.Resource);
+
+            var countAfter = await Client.SearchAsync("Patient?deceased=false&_summary=count");
+
+            Assert.Equal(countBefore.Resource.Total, countAfter.Resource.Total);
+        }
+    }
+}

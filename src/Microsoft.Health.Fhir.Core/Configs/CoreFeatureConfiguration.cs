@@ -1,0 +1,178 @@
+﻿// -------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
+// -------------------------------------------------------------------------------------------------
+
+using Microsoft.Health.Fhir.Core.Features.Search;
+
+namespace Microsoft.Health.Fhir.Core.Configs
+{
+    /// <summary>
+    /// Core feature configurations.
+    /// </summary>
+    public class CoreFeatureConfiguration
+    {
+        private VersioningConfiguration _versioning = new VersioningConfiguration();
+
+        /// <summary>
+        /// Defines CapabilityStatement.name
+        /// </summary>
+        public string SoftwareName { get; set; } = Resources.ServerName;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether Batch is enabled or not.
+        /// </summary>
+        public bool SupportsBatch { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether Transaction is enabled or not.
+        /// </summary>
+        public bool SupportsTransaction { get; set; }
+
+        /// <summary>
+        /// Gets or sets the default value for IncludeTotal in search bundles.
+        /// </summary>
+        public TotalType IncludeTotalInBundle { get; set; } = TotalType.None;
+
+        /// <summary>
+        /// Gets or sets the maximum value for _count in search.
+        /// </summary>
+        public int MaxItemCountPerSearch { get; set; } = 1000;
+
+        /// <summary>
+        /// Gets or sets the default value for _count in search.
+        /// </summary>
+        public int DefaultItemCountPerSearch { get; set; } = 10;
+
+        /// <summary>
+        /// Gets or sets the max value for included search results.
+        /// </summary>
+        public int MaxIncludeCountPerSearch { get; set; } = 1000;
+
+        /// <summary>
+        /// Gets or sets the default value for included search results.
+        /// </summary>
+        public int DefaultIncludeCountPerSearch { get; set; } = 1000;
+
+        /// <summary>
+        /// Gets or sets a value whether we need to run profile validation during resource creation.
+        /// </summary>
+        public bool ProfileValidationOnCreate { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets a value whether we need to run profile validation during resource update.
+        /// </summary>
+        public bool ProfileValidationOnUpdate { get; set; } = false;
+
+        /// <summary>
+        /// Maximum items allowed to be deleted when using Conditional Delete.
+        /// </summary>
+        public int ConditionalDeleteMaxItems { get; set; } = 100;
+
+        /// <summary>
+        /// Gets or sets a value whether capturing resource change data is enabled or not.
+        /// </summary>
+        public bool SupportsResourceChangeCapture { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets the resource versioning policy.
+        /// When binding from config, will normalized.
+        /// </summary>
+        public VersioningConfiguration Versioning
+        {
+            get => _versioning;
+            set
+            {
+                _versioning = value;
+
+                // When we bind from configuration, normalize the values to lower case.
+                _versioning?.NormalizeOverrideValues();
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the server supports the $status operation for SearchParameters.
+        /// </summary>
+        public bool SupportsSelectableSearchParameters { get; set; }
+
+        /// <summary>
+        /// Whether the service supports SQL read only replicas.
+        /// </summary>
+        public bool SupportsSqlReplicas { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the server supports the includes.
+        /// </summary>
+        public bool SupportsIncludes { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether geo-redundancy monitoring is enabled.
+        /// When enabled, the system will monitor geo-replication lag and status through
+        /// the GeoReplicationLagWatchdog. This feature is only applicable when using
+        /// Azure SQL Database with geo-replication configured.
+        /// </summary>
+        public bool EnableGeoRedundancy { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether stale job queue monitoring is enabled.
+        /// When enabled (the default), the <c>JobMonitorWatchdog</c> periodically reads aggregate job
+        /// queue state and emits the <c>Jobs.OldestQueuedAge</c> and <c>Jobs.QueueDepth</c> metrics.
+        /// Disabling it stops the periodic SQL reads and metric publication without affecting job processing.
+        /// </summary>
+        public bool EnableJobMonitor { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the refresh interval in seconds for the SearchParameter cache background service.
+        /// The background service will call EnsureCacheFreshnessAsync at this interval to keep
+        /// SearchParameter cache synchronized across instances. Default is 60 seconds if not specified.
+        /// </summary>
+        public int SearchParameterCacheRefreshIntervalSeconds { get; set; } = 20;
+
+        /// <summary>
+        /// Gets or sets the maximum initial delay in seconds for the SearchParameter cache background service timer.
+        /// This random delay (0 to this value) staggers timer startup across instances to prevent thundering herd.
+        /// Default is 15 seconds. Set to 0 to disable the delay (useful for testing).
+        /// </summary>
+        public int SearchParameterCacheRefreshMaxInitialDelaySeconds { get; set; } = 15;
+
+        /// <summary>
+        /// Gets or sets the refresh interval in seconds for the SystemConformanceProvider cache background service.
+        /// </summary>
+        public int SystemConformanceProviderRefreshIntervalSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// Gets or sets the rebuild interval in seconds for the SystemConformanceProvider background service.
+        /// </summary>
+        public int SystemConformanceProviderRebuildIntervalSeconds { get; set; } = 14400; // 4 hours.
+
+        /// <summary>
+        /// Gets or sets a value indicating whether FHIR resources with dangerous href schemes
+        /// (e.g., javascript:, vbscript:) in narrative HTML should be rejected during validation.
+        /// When false (default), a warning is logged but the resource is accepted.
+        /// When true, the resource is rejected with a validation error.
+        /// </summary>
+        public bool RejectDangerousNarrativeHrefs { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether Device resources in a SMART compartment are restricted
+        /// to those without a patient reference, or (for Patient compartments) those whose patient reference
+        /// matches the compartment. When false, all Device resources are treated as universal resources.
+        /// Only effective when the Device resource type has a "patient" search parameter (STU3/R4/R4B).
+        /// </summary>
+        public bool EnableSmartCompartmentDeviceRestriction { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the $member-match operation is rejected for SMART
+        /// requests whenever fine-grained access control applies to the request. When true (the default),
+        /// requests with an active SMART scope context are forbidden from calling $member-match, after
+        /// the usual RBAC read authorization check. When false, the pre-existing behavior is restored and
+        /// $member-match is allowed for SMART requests, matching non-SMART behavior.
+        /// </summary>
+        public bool EnableSmartMemberMatchRestriction { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether SMART system scope authorization is enforced for Bulk Export.
+        /// </summary>
+        public bool EnableSmartExportScopeAuthorization { get; set; } = true;
+    }
+}
